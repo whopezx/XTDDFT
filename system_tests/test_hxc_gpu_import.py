@@ -31,3 +31,20 @@ def test_mc_gpu_response_imports_optional_module(monkeypatch, has_sf_kernel):
 
     np.testing.assert_array_equal(vind(np.ones((2, 2))),
                                   np.full((2, 2), 3.0 if has_sf_kernel else 6.0))
+
+
+@pytest.mark.parametrize("xctype,ncomp", [("LDA", 1), ("GGA", 4), ("MGGA", 5)])
+def test_alda0_rks_kernel_matches_nr_rks_fxc_block(xctype, ncomp):
+    """nr_rks_fxc multiplies fxc[:,:,p0:p1] into an (ncomp, ncomp, block) buffer."""
+    kernel = np.arange(6, dtype=float)
+    fxc = hxc_part.embed_alda0_rks_kernel(kernel, xctype, ngrids=8)
+    block = 3
+    weights = np.ones(block)
+    out = np.empty((ncomp, ncomp, block))
+    np.multiply(fxc[:, :, 0:block], weights, out=out)
+    assert fxc.shape == (ncomp, ncomp, 8)
+    np.testing.assert_allclose(out[0, 0], kernel[:block])
+    np.testing.assert_allclose(fxc[0, 0, :kernel.size], kernel)
+    assert np.all(fxc[0, 0, kernel.size:] == 0)
+    if ncomp > 1:
+        assert np.all(fxc[1:] == 0)

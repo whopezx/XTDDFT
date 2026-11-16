@@ -119,6 +119,203 @@ def _convert_a2b_to_cv_co_ov_oo(amat, nc, no, nv):
     ordered = np.asarray(amat)[np.ix_(idx, idx)]
     return ordered
 
+# Eq. (12) overlap above this value is the intra-multiplet Ms=S-1 component.
+_INTRA_OVERLAP = 0.50
+# SA=0 Δ<S^2> window for a pure reference-spin or Sf=S-1 assignment.
+_S2_ASSIGN_TOL = 0.40
+# |S - target| window for spectroscopic labels (singlet, triplet, ...).
+_SPIN_LABEL_TOL = 0.15
+
+
+def _is_near(value, target, tol):
+    return abs(float(value) - float(target)) <= tol
+
+
+def _spin_symbol(spin):
+    """Short label for a spin: S, D, T, Q, or M{2S+1}."""
+    named = ((0.0, "S"), (0.5, "D"), (1.0, "T"), (1.5, "Q"))
+    for target, symbol in named:
+        if _is_near(spin, target, _SPIN_LABEL_TOL):
+            return symbol
+    multiplicity = int(round(2.0 * float(spin) + 1.0))
+    return f"M{multiplicity}"
+
+
+def _assign_sfd_kind(sa, delta_s2, overlap, reference_s):
+    """Classify one XSF root relative to the high-spin reference.
+
+    ``eq12`` is the intra-multiplet amplitude of Eq. (12). ``reference-spin``
+    is another root with the reference spin (SA=0 only). ``target-spin`` is
+    an Sf=S-1 spin-flip-down state. ``mixed`` is an SA=0 root whose
+    Δ<S^2> sits between those limits.
+    """
+    if overlap >= _INTRA_OVERLAP:
+        return "eq12"
+    if sa > 0:
+        # Spin-adapted SFD roots are Sf = S-1. The Eq. (12) direction is the
+        # overlap test above; remove=True projects it out of this space.
+        return "target-spin"
+    if delta_s2 is None or not np.isfinite(delta_s2):
+        return "mixed"
+    if _is_near(delta_s2, 0.0, _S2_ASSIGN_TOL):
+        return "reference-spin"
+    if _is_near(delta_s2, -2.0 * float(reference_s), _S2_ASSIGN_TOL):
+        return "target-spin"
+    return "mixed"
+
+
+def _family_for_kind(kind, reference_s):
+    """Map a root kind onto singlet / triplet / reference / target / other."""
+    reference_s = float(reference_s)
+    target_s = reference_s - 1.0
+    if kind in ("eq12", "reference-spin"):
+        if _is_near(reference_s, 1.0, _SPIN_LABEL_TOL):
+            return "triplet"
+        return "reference"
+    if kind == "target-spin":
+        if _is_near(target_s, 0.0, _SPIN_LABEL_TOL):
+            return "singlet"
+        if _is_near(target_s, 1.0, _SPIN_LABEL_TOL):
+            return "triplet"
+        return "target"
+    return "other"
+
+
+def _contract_or_zero(spec, *operands, like):
+    """Contract, or return zeros when a block dimension is empty."""
+    if any(getattr(operand, "size", 0) == 0 for operand in operands):
+        return get_array_module(like).zeros_like(like)
+    return contract(spec, *operands)
+
+
+class S0T1Report:
+    """Triplet energies and the S0–T1 gap for one XSF-TDA calculation.
+
+    Attributes use Hartree unless the name ends in ``_ev``. ``kernel()``
+    eigenvalues are unchanged: ``roots_vs_roks_*`` copies them. See
+    ``XSF_TDA_down.s0_t1_report``.
+    """
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def __repr__(self):
+        gap = self.gap_ev
+        gap_text = "n/a" if gap is None else f"{gap:.6f} eV"
+        return (
+            f"S0T1Report(gap={gap_text}, omega0={self.omega0_ev:.6f} eV, "
+            f"eq15_applied={self.eq15_applied}, zero={self.quoted_zero})"
+        )
+
+
+def _energy_row(**kwargs):
+    row = dict(
+        spectroscopic="",
+        kind="",
+        family="",
+        root=None,
+        root_label=None,
+        in_spectrum=False,
+        eigenvalue_ha=None,
+        vs_roks_ha=None,
+        vs_roks_ev=None,
+        vs_t1_ha=None,
+        vs_t1_ev=None,
+        eq15_ha=None,
+        eq15_ev=None,
+        quoted_ha=None,
+        quoted_ev=None,
+        overlap=None,
+        delta_s2=None,
+    )
+    row.update(kwargs)
+    return SimpleNamespace(**row)
+
+
+def _fmt_ev(value):
+    if value is None or not np.isfinite(value):
+        return "      n/a"
+    return f"{value:10.5f}"
+
+
+def _print_s0_t1_report(report):
+    print("S0-T1 gap")
+    print("------------------------------------------------------------")
+    print(
+        f"Reference S={report.reference_s:.3f} "
+        f"(multiplicity {report.reference_multiplicity:.0f}), "
+        f"SFD target Sf={report.target_s:.3f} "
+        f"(multiplicity {report.target_multiplicity:.0f}), "
+        f"SA={report.sa}, remove={report.remove}, method={report.method_label}"
+    )
+    print(
+        f"omega0 = x^T [A-] x = {report.omega0_ha: .8f} Ha "
+        f"= {report.omega0_ev: .5f} eV  [{report.a_minus_source}]"
+    )
+    print(report.eq15_reason)
+    if report.spin_warning:
+        print(report.spin_warning)
+    if report.reference_is_triplet:
+        print(
+            "T1 is the Eq. (12) Ms=S-1 component of the reference triplet. "
+            "E(T1)-E(ROKS) = omega0. remove=True projects that component "
+            "out of the XSF eigenvalue problem."
+        )
+        print("S0 is the lowest singlet among the XSF roots from kernel().")
+        if report.eq15_applied:
+            print(
+                "Eq. (15) quoted energies use zero at corrected T1: "
+                "omega_tilde = omega - omega0. E(T1) quoted = 0."
+            )
+        else:
+            print(
+                "Quoted energies are versus the high-spin ROKS reference. "
+                "The vs-T1 column is E-E(T1) and is not an Eq. (15) shift."
+            )
+    elif report.note:
+        print(report.note)
+    if report.note and report.reference_is_triplet:
+        print(report.note)
+    print(f"E(T1)-E(ROKS) = {_fmt_ev(report.t1_vs_roks_ev)} eV")
+    print(f"E(S0)-E(ROKS) = {_fmt_ev(report.s0_vs_roks_ev)} eV")
+    print(f"E(S0)-E(T1)   = {_fmt_ev(report.gap_ev)} eV")
+    if report.quoted_zero != "ROKS":
+        print(
+            f"Quoted zero: {report.quoted_zero}. "
+            f"E(T1)={_fmt_ev(report.e_t1_ev)} eV, "
+            f"E(S0)={_fmt_ev(report.e_s0_ev)} eV."
+        )
+    print("Triplet excitations:")
+    if not report.triplets:
+        print("  (none in this spin-flip-down space)")
+    for row in report.triplets:
+        where = "Eq. (12)" if row.root_label is None else f"root {row.root_label:d}"
+        print(
+            f"  {row.spectroscopic:<4} {where:<8} "
+            f"vs ROKS {_fmt_ev(row.vs_roks_ev)} eV  "
+            f"vs T1 {_fmt_ev(row.vs_t1_ev)} eV"
+        )
+    print("Singlet roots:")
+    if not report.singlets:
+        print("  (none in the computed XSF roots)")
+    for row in report.singlets:
+        print(
+            f"  {row.spectroscopic:<4} root {row.root_label:<3d} "
+            f"vs ROKS {_fmt_ev(row.vs_roks_ev)} eV  "
+            f"vs T1 {_fmt_ev(row.vs_t1_ev)} eV"
+        )
+    if report.others:
+        print("Other computed roots:")
+        for row in report.others:
+            label = row.spectroscopic or row.family
+            print(
+                f"  {label:<4} root {row.root_label:<3d} "
+                f"vs ROKS {_fmt_ev(row.vs_roks_ev)} eV  "
+                f"kind={row.kind}"
+            )
+    print("========================================")
+
+
 class XSF_TDA_down(XTDDFT_base): # just for ROKS
     def __init__(self, mf, method, davidson=True, SA = None, davidson_backend="cpu",
                  davidson_method="davidson",
@@ -130,6 +327,10 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
            SA=1: only add diagonal block for dA
            SA=2: add all dA except for OO block
            SA=3: full dA
+
+        Triplet energies and the S0–T1 gap are opt-in. After ``kernel()``,
+        call ``s0_t1_report()``, or pass ``s0_t1=True`` to ``kernel`` or
+        ``analyse``. That report does not change ``self.e``.
         """
         if method not in (0, 1, 2):
             raise ValueError("method must be 0 (ALDA0), 1 (multicollinear), or 2 (collinear)")
@@ -1677,6 +1878,538 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
 
     analyze_TDM = calculate_TDM
 
+    def _check_roks_orbital_blocks(self):
+        """Require the closed | open | virtual order used by A^-."""
+        if self.type_u:
+            raise NotImplementedError(
+                "Eq. (12) is the restricted open-shell spin flip. "
+                "Unrestricted XSF-TDA references are not supported for omega0 "
+                "or the S0-T1 gap."
+            )
+        no = int(self.no)
+        if no < 1:
+            raise ValueError("Eq. (12) needs at least one open-shell orbital.")
+        nc, nv = int(self.nc), int(self.nv)
+        occ_a = np.asarray(_asnumpy(self.occidx_a), dtype=int)
+        vir_b = np.asarray(_asnumpy(self.viridx_b), dtype=int)
+        expected_occ = np.arange(nc + no)
+        expected_vir = np.arange(nc, nc + no + nv)
+        if occ_a.shape != expected_occ.shape or not np.array_equal(occ_a, expected_occ):
+            raise NotImplementedError(
+                "omega0 assumes high-spin RO orbitals ordered closed, open, virtual. "
+                f"Alpha occupied indices are {occ_a.tolist()}."
+            )
+        if vir_b.shape != expected_vir.shape or not np.array_equal(vir_b, expected_vir):
+            raise NotImplementedError(
+                "omega0 assumes high-spin RO orbitals ordered closed, open, virtual. "
+                f"Beta virtual indices are {vir_b.tolist()}."
+            )
+
+    def intra_multiplet_vector(self):
+        """Eq. (12) amplitude in the full CV|CO|OV|OO space.
+
+        Open-shell diagonal flips mα → mβ each carry amplitude
+        ``1/sqrt(n_open)``. For a high-spin RO determinant, ``n_open = 2S``.
+        Closed-virtual, closed-open, and open-virtual amplitudes are zero.
+        The vector is normalized and is the direction removed when
+        ``remove=True``.
+        """
+        self._check_roks_orbital_blocks()
+        nc, no, nv = int(self.nc), int(self.no), int(self.nv)
+        dim3 = nc * nv + nc * no + no * nv
+        vector = np.zeros(dim3 + no * no)
+        amplitude = 1.0 / np.sqrt(no)
+        for orbital in range(no):
+            vector[dim3 + orbital * no + orbital] = amplitude
+        return vector
+
+    def _base_sf_response(self):
+        """Response that builds A^-: ALDA0, MCOL, or collinear, without ΔA."""
+        key = (int(self.method), int(self.collinear_samples))
+        cached = getattr(self, "_base_sf_response_fn", None)
+        if cached is not None and getattr(self, "_base_sf_response_key", None) == key:
+            return cached
+        if self.method == 1:
+            response = gen_response_sf_mc(
+                self.mf, hermi=0, collinear_samples=self.collinear_samples,
+                ctx=self.ctx,
+            )
+        else:
+            response = gen_response_sf(
+                self.mf, hermi=0, ctx=self.ctx, with_xc=self.method == 0,
+            )
+        self._base_sf_response_fn = response
+        self._base_sf_response_key = key
+        return response
+
+    def _apply_A_minus(self, vector):
+        """Apply A^- to one full-space vector.
+
+        A^- is the μ=-1 spin-flip matrix on the ROKS orbitals (the base
+        ALDA0/MCOL/COL response plus the Fock shift). ΔA and the Eq. (12)
+        projection are not included, matching ω0 = x^T [A^-] x in
+        Chibueze & Visscher, J. Chem. Phys. 163, 094111 (2025).
+        """
+        self._check_roks_orbital_blocks()
+        vector = np.asarray(_asnumpy(vector), dtype=float).reshape(-1)
+        nc, no, nv = int(self.nc), int(self.no), int(self.nv)
+        full = (nc + no) * (no + nv)
+        if vector.size != full:
+            raise ValueError(
+                f"A^- vector length {vector.size} does not match the full "
+                f"spin-flip space {full}."
+            )
+        dim1 = nc * nv
+        dim2 = dim1 + nc * no
+        dim3 = dim2 + no * nv
+        cv = xp.asarray(vector[:dim1].reshape(1, nc, nv))
+        co = xp.asarray(vector[dim1:dim2].reshape(1, nc, no))
+        ov = xp.asarray(vector[dim2:dim3].reshape(1, no, nv))
+        oo = xp.asarray(vector[dim3:].reshape(1, no, no))
+
+        mo_coeff = _asarray(self.mo_coeff)
+        orb_occ_a = mo_coeff[0][:, self.occidx_a]
+        orb_vir_b = mo_coeff[1][:, self.viridx_b]
+        orb_c = orb_occ_a[:, :nc]
+        orb_o_a = orb_occ_a[:, nc:nc + no]
+        orb_o_b = orb_vir_b[:, :no]
+        orb_v = orb_vir_b[:, no:]
+        fock_a, fock_b = self._get_fock_mo()
+        fa_cc = fock_a[:nc, :nc]
+        fa_co = fock_a[:nc, nc:nc + no]
+        fa_oc = fock_a[nc:nc + no, :nc]
+        fa_oo = fock_a[nc:nc + no, nc:nc + no]
+        fb_oo = fock_b[nc:nc + no, nc:nc + no]
+        fb_ov = fock_b[nc:nc + no, nc + no:]
+        fb_vo = fock_b[nc + no:, nc:nc + no]
+        fb_vv = fock_b[nc + no:, nc + no:]
+
+        nao = int(orb_occ_a.shape[0])
+        density = xp.zeros((1, nao, nao))
+        density = density + _contract_or_zero(
+            "xia,qa,pi->xpq", cv, orb_v.conj(), orb_c, like=density,
+        )
+        density = density + _contract_or_zero(
+            "xiu,qu,pi->xpq", co, orb_o_b.conj(), orb_c, like=density,
+        )
+        density = density + _contract_or_zero(
+            "xua,qa,pu->xpq", ov, orb_v.conj(), orb_o_a, like=density,
+        )
+        density = density + _contract_or_zero(
+            "xuv,qv,pu->xpq", oo, orb_o_b.conj(), orb_o_a, like=density,
+        )
+        potential = self._base_sf_response()(density)
+        vs_cv = _contract_or_zero(
+            "xpq,pi,qa->xia", potential, orb_c.conj(), orb_v, like=cv,
+        )
+        vs_co = _contract_or_zero(
+            "xpq,pi,qu->xiu", potential, orb_c.conj(), orb_o_b, like=co,
+        )
+        vs_ov = _contract_or_zero(
+            "xpq,pu,qa->xua", potential, orb_o_a.conj(), orb_v, like=ov,
+        )
+        vs_oo = _contract_or_zero(
+            "xpq,pu,qv->xuv", potential, orb_o_a.conj(), orb_o_b, like=oo,
+        )
+        vs_cv = vs_cv + _contract_or_zero("xiu,ua->xia", co, fb_ov, like=cv)
+        vs_cv = vs_cv + _contract_or_zero("xib,ba->xia", cv, fb_vv, like=cv)
+        vs_cv = vs_cv - _contract_or_zero("ij,xja->xia", fa_cc, cv, like=cv)
+        vs_cv = vs_cv - _contract_or_zero("iu,xua->xia", fa_co, ov, like=cv)
+        vs_co = vs_co + _contract_or_zero("xiv,vu->xiu", co, fb_oo, like=co)
+        vs_co = vs_co + _contract_or_zero("xia,au->xiu", cv, fb_vo, like=co)
+        vs_co = vs_co - _contract_or_zero("ij,xju->xiu", fa_cc, co, like=co)
+        vs_co = vs_co - _contract_or_zero("iv,xvu->xiu", fa_co, oo, like=co)
+        vs_ov = vs_ov + _contract_or_zero("xuv,va->xua", oo, fb_ov, like=ov)
+        vs_ov = vs_ov + _contract_or_zero("xub,ba->xua", ov, fb_vv, like=ov)
+        vs_ov = vs_ov - _contract_or_zero("ui,xia->xua", fa_oc, cv, like=ov)
+        vs_ov = vs_ov - _contract_or_zero("uv,xva->xua", fa_oo, ov, like=ov)
+        vs_oo = vs_oo + _contract_or_zero("xuw,wv->xuv", oo, fb_oo, like=oo)
+        vs_oo = vs_oo + _contract_or_zero("xua,av->xuv", ov, fb_vo, like=oo)
+        vs_oo = vs_oo - _contract_or_zero("ui,xiv->xuv", fa_oc, co, like=oo)
+        vs_oo = vs_oo - _contract_or_zero("uw,xwv->xuv", fa_oo, oo, like=oo)
+        return np.concatenate([
+            np.asarray(_asnumpy(vs_cv), dtype=float).reshape(-1),
+            np.asarray(_asnumpy(vs_co), dtype=float).reshape(-1),
+            np.asarray(_asnumpy(vs_ov), dtype=float).reshape(-1),
+            np.asarray(_asnumpy(vs_oo), dtype=float).reshape(-1),
+        ])
+
+    def _omega0_value(self):
+        """Return (ω0 in Hartree, source name).
+
+        The source is ``sf_tda_A`` when the dense A^- matrix is already
+        stored, and ``response`` when A^- is applied as one matrix-vector
+        product. Both omit ΔA.
+        """
+        amplitude = self.intra_multiplet_vector()
+        matrix = getattr(self, "sf_tda_A", None)
+        if matrix is not None and np.shape(matrix) == (amplitude.size, amplitude.size):
+            ax = np.asarray(matrix, dtype=float) @ amplitude
+            source = "sf_tda_A"
+        else:
+            ax = self._apply_A_minus(amplitude)
+            source = "response"
+        omega0_ha = float(np.real(np.vdot(amplitude, ax)))
+        return omega0_ha, source
+
+    def omega0(self):
+        """Intra-multiplet energy ω0 = x^T [A^-] x, in Hartree.
+
+        This is E(Ms=S-1) - E(high-spin ROKS) for the reference multiplet
+        (Eqs. (12)–(14)). It is an expectation value on A^-, not a
+        spin-adapted eigenvalue and not a ΔA contribution. Pure HF gives
+        ω0 = 0. ALDA0 can make it nonzero.
+        """
+        value, _source = self._omega0_value()
+        return value
+
+    def _expanded_eigenvector(self, nstate):
+        """Eigenvector in the full CV|CO|OV|OO space, undoing ``remove``."""
+        value = np.asarray(_asnumpy(self.v[:, nstate]), dtype=float).reshape(-1)
+        full = (int(self.nc) + int(self.no)) * (int(self.no) + int(self.nv))
+        if value.size == full:
+            return value
+        if value.size != full - 1:
+            raise NotImplementedError(
+                "The S0-T1 report does not support frozen-orbital truncation."
+            )
+        previous = self.re
+        self.re = True
+        try:
+            cv, co, ov, oo = self._split_analysis_vectors(value)
+        finally:
+            self.re = previous
+        return np.concatenate([
+            np.asarray(cv, dtype=float).reshape(-1),
+            np.asarray(co, dtype=float).reshape(-1),
+            np.asarray(ov, dtype=float).reshape(-1),
+            np.asarray(oo, dtype=float).reshape(-1),
+        ])
+
+    def _eq15_decision(self, eq15):
+        """Return (applied, reason) for the Eq. (15) shift.
+
+        ``eq15=None`` applies the shift only for ALDA0 (``method=0``) on a
+        DFT reference. Collinear and multicollinear kernels are not the
+        ALDA replacement in Sec. II.D, so the shift stays off unless
+        ``eq15=True``. Hartree–Fock has no DFT kernel; Eq. (13) already
+        requires ω0 = 0.
+        """
+        if eq15 is True:
+            return True, "Eq. (15) was requested explicitly (eq15=True)."
+        if eq15 is False:
+            return False, "Eq. (15) was disabled explicitly (eq15=False)."
+        if eq15 is not None:
+            raise ValueError("eq15 must be True, False, or None.")
+        if self.method == 0 and self.mfxctype not in (None, "HF") and self.xctype not in (None, "HF"):
+            return True, (
+                "Eq. (15) is applied because method=0 is ALDA0. "
+                "Corrected energies are omega_tilde = omega - omega0."
+            )
+        if self.method == 0:
+            return False, (
+                "Eq. (15) is not applied: method=0 on Hartree-Fock has no DFT "
+                "kernel, and Eq. (13) requires omega0 = 0."
+            )
+        if self.method == 1:
+            return False, (
+                "Eq. (15) is not applied. method=1 is the multicollinear kernel, "
+                "not the ALDA/ALDA0 replacement in Sec. II.D. "
+                "Pass eq15=True to subtract omega0 anyway."
+            )
+        if self.method == 2:
+            return False, (
+                "Eq. (15) is not applied. method=2 is the collinear kernel "
+                "(no spin-flip XC kernel), not an ALDA approximation. "
+                "Pass eq15=True to subtract omega0 anyway."
+            )
+        return False, "Eq. (15) is not applied."
+
+    def _quote_energy(self, vs_roks_ha, eq15_ha, applied):
+        """Quoted energy: Eq. (15) when that shift is applied, otherwise versus ROKS."""
+        if applied:
+            return eq15_ha
+        return vs_roks_ha
+
+    def s0_t1_report(self, eq15=None, print_report=True):
+        """Triplet excitation energies and the S0–T1 gap.
+
+        Call this after ``kernel()``. It does not modify ``self.e`` or
+        ``self.v``. ``kernel(..., s0_t1=True)`` and
+        ``analyse(..., s0_t1=True)`` build the same report.
+
+        For a triplet ROKS reference (S=1), spin-adapted XSF-TDA roots are
+        singlets (Sf=0). T1 is not one of those roots when ``remove=True``.
+        It is the Ms=0 component of the same triplet, Eq. (12), and
+
+            omega0 = x^T [A^-] x = E(T1) - E(ROKS).
+
+        S0 is the lowest singlet among the roots returned by ``kernel()``.
+        The gap is
+
+            E(S0) - E(T1) = omega_S0 - omega0,
+
+        with both energies measured from the high-spin ROKS reference.
+        Eq. (15), ``omega_tilde = omega - omega0``, shifts that common zero
+        onto T1. The gap itself does not depend on whether the shift is
+        applied. The shift is applied for ALDA0 (``method=0``) unless
+        ``eq15`` overrides it. Collinear (``method=2``) and multicollinear
+        (``method=1``) results keep the ROKS zero unless ``eq15=True``.
+
+        SA=0 can also contain other reference-spin roots. Those are labeled
+        T2, T3, ... when the reference is a triplet, using Δ<S^2>. If
+        ``remove=False`` leaves Eq. (12) inside the diagonalization, that
+        root is identified by its overlap with x, but E(T1) remains the
+        expectation value ω0. A^- does not have to have x as an eigenvector.
+        A quintet reference has Sf=1, so the XSF roots themselves are the
+        triplet excitations; S0 is then outside this spin-flip-down space
+        and the gap is not set.
+
+        The quoted zero is ``T1`` when Eq. (15) is applied for a triplet
+        reference, and ``ROKS`` otherwise. ``roots_eq15_*`` always holds
+        ``self.e - omega0`` so the shift can be inspected either way.
+        """
+        if self.e is None or self.v is None:
+            raise ValueError("Run kernel() before requesting the S0-T1 gap.")
+        self._check_roks_orbital_blocks()
+        energies = np.asarray(_asnumpy(self.e), dtype=float).reshape(-1)
+        n_vectors = int(_asnumpy(self.v).shape[1])
+        nstates = min(int(self.nstates or 0), energies.size, n_vectors)
+        omega0_ha, source = self._omega0_value()
+        applied, reason = self._eq15_decision(eq15)
+        amplitude = self.intra_multiplet_vector()
+        try:
+            delta_s2 = np.asarray(self.deltaS2(), dtype=float).reshape(-1)
+        except Exception as err:
+            logger.warning(f"Delta <S^2> was not used for S0-T1 assignment: {err}")
+            delta_s2 = np.full(nstates, np.nan)
+
+        reference_s = float(self.ground_s)
+        reference_is_triplet = _is_near(reference_s, 1.0, _SPIN_LABEL_TOL)
+        target_s = reference_s - 1.0
+        computed = []
+        for state in range(nstates):
+            vector = self._expanded_eigenvector(state)
+            overlap = abs(float(np.real(np.vdot(amplitude, vector))))
+            delta = float(delta_s2[state]) if state < delta_s2.size else float("nan")
+            kind = _assign_sfd_kind(int(self.SA), delta, overlap, reference_s)
+            family = _family_for_kind(kind, reference_s)
+            energy_ha = float(energies[state])
+            computed.append(_energy_row(
+                kind=kind,
+                family=family,
+                root=state,
+                root_label=state + 1,
+                in_spectrum=True,
+                eigenvalue_ha=energy_ha,
+                vs_roks_ha=energy_ha,
+                vs_roks_ev=energy_ha * ha2eV,
+                overlap=overlap,
+                delta_s2=delta,
+            ))
+
+        singlets = sorted(
+            (row for row in computed if row.family == "singlet"),
+            key=lambda row: row.vs_roks_ha,
+        )
+        for index, row in enumerate(singlets):
+            row.spectroscopic = f"S{index}"
+
+        reference_spin_rows = [
+            row for row in computed
+            if row.family == "reference" or (
+                row.family == "triplet" and row.kind in ("eq12", "reference-spin")
+                and reference_is_triplet
+            )
+        ]
+        target_triplet_rows = [
+            row for row in computed
+            if row.family == "triplet" and row.kind == "target-spin"
+        ]
+        triplets = []
+        if reference_is_triplet:
+            eq12_rows = sorted(
+                (row for row in computed if row.kind == "eq12"),
+                key=lambda row: row.overlap,
+                reverse=True,
+            )
+            eq12 = eq12_rows[0] if eq12_rows else None
+            triplets.append(_energy_row(
+                spectroscopic="T1",
+                kind="eq12",
+                family="triplet",
+                root=None if eq12 is None else eq12.root,
+                root_label=None if eq12 is None else eq12.root_label,
+                in_spectrum=eq12 is not None,
+                eigenvalue_ha=None if eq12 is None else eq12.eigenvalue_ha,
+                vs_roks_ha=omega0_ha,
+                vs_roks_ev=omega0_ha * ha2eV,
+                overlap=1.0 if eq12 is None else eq12.overlap,
+                delta_s2=0.0 if eq12 is None else eq12.delta_s2,
+            ))
+            excited = sorted(
+                (row for row in computed if row.family == "triplet" and row.kind != "eq12"),
+                key=lambda row: row.vs_roks_ha,
+            )
+            for index, row in enumerate(excited, start=2):
+                row.spectroscopic = f"T{index}"
+                triplets.append(row)
+        else:
+            excited = sorted(target_triplet_rows, key=lambda row: row.vs_roks_ha)
+            for index, row in enumerate(excited, start=1):
+                row.spectroscopic = f"T{index}"
+                triplets.append(row)
+
+        t1 = triplets[0] if triplets else None
+        t1_vs_roks = None if t1 is None else t1.vs_roks_ha
+        for row in computed:
+            row.eq15_ha = row.vs_roks_ha - omega0_ha
+            row.eq15_ev = row.eq15_ha * ha2eV
+            if t1_vs_roks is None:
+                row.vs_t1_ha = None
+                row.vs_t1_ev = None
+            else:
+                row.vs_t1_ha = row.vs_roks_ha - t1_vs_roks
+                row.vs_t1_ev = row.vs_t1_ha * ha2eV
+            quoted = self._quote_energy(row.vs_roks_ha, row.eq15_ha, applied)
+            row.quoted_ha = quoted
+            row.quoted_ev = None if quoted is None else quoted * ha2eV
+        for row in triplets:
+            row.eq15_ha = row.vs_roks_ha - omega0_ha
+            row.eq15_ev = row.eq15_ha * ha2eV
+            if t1_vs_roks is None:
+                row.vs_t1_ha = None
+                row.vs_t1_ev = None
+            else:
+                row.vs_t1_ha = row.vs_roks_ha - t1_vs_roks
+                row.vs_t1_ev = row.vs_t1_ha * ha2eV
+            quoted = self._quote_energy(row.vs_roks_ha, row.eq15_ha, applied)
+            row.quoted_ha = quoted
+            row.quoted_ev = None if quoted is None else quoted * ha2eV
+
+        s0 = singlets[0] if singlets else None
+        gap_ha = None
+        if reference_is_triplet and s0 is not None and t1 is not None:
+            gap_ha = s0.vs_roks_ha - t1.vs_roks_ha
+        if applied and reference_is_triplet:
+            quoted_zero = "T1"
+        elif applied:
+            quoted_zero = "reference-multiplet"
+        else:
+            quoted_zero = "ROKS"
+        spin_warning = None
+        if abs(reference_s - int(self.no) / 2.0) > 0.05:
+            spin_warning = (
+                f"spin_square gives S={reference_s:.4f}, while "
+                f"n_open/2={int(self.no) / 2.0:.4f}. "
+                "The Eq. (12) amplitude uses 1/sqrt(n_open)."
+            )
+        note = None
+        if reference_is_triplet and s0 is None:
+            note = (
+                "No singlet root is in the computed window. Increase nstates. "
+                "With SA=0 and remove=False the lowest root is often T1 rather than S0."
+            )
+        elif not reference_is_triplet and _is_near(target_s, 1.0, _SPIN_LABEL_TOL):
+            note = (
+                "The spin-flip-down target is a triplet (Sf=1). "
+                "Those roots are the triplet excitations versus the high-spin "
+                "reference. S0 is not in this SFD space, so the S0-T1 gap is not set. "
+                "omega0 is the reference multiplet, not T1."
+            )
+        elif not reference_is_triplet:
+            note = (
+                "The S0-T1 gap is set for a triplet reference, where T1 is the "
+                "Eq. (12) component and S0 is the lowest singlet XSF root."
+            )
+        if (
+            reference_is_triplet and t1 is not None and t1.in_spectrum
+            and t1.eigenvalue_ha is not None
+            and abs(t1.eigenvalue_ha - omega0_ha) > 1.0e-5
+        ):
+            note = (note or "") + (
+                " The in-spectrum Eq. (12) eigenvalue is "
+                f"{t1.eigenvalue_ha * ha2eV:.5f} eV versus ROKS; "
+                "E(T1) uses the omega0 expectation value, not that eigenvalue."
+            )
+
+        labeled_ids = {
+            id(row) for row in singlets + triplets if getattr(row, "in_spectrum", False)
+        }
+        others = []
+        for row in computed:
+            if id(row) in labeled_ids:
+                continue
+            if row.kind == "eq12" and reference_is_triplet and t1 is not None and row.root == t1.root:
+                continue
+            if row.family == "target":
+                row.spectroscopic = _spin_symbol(target_s)
+            elif row.family == "reference":
+                row.spectroscopic = _spin_symbol(reference_s) + "ref"
+            else:
+                row.spectroscopic = row.kind
+            others.append(row)
+
+        report = S0T1Report(
+            reference_s=reference_s,
+            reference_multiplicity=2.0 * reference_s + 1.0,
+            target_s=target_s,
+            target_multiplicity=2.0 * target_s + 1.0,
+            reference_is_triplet=reference_is_triplet,
+            n_open=int(self.no),
+            sa=int(self.SA),
+            remove=bool(self.re),
+            method=int(self.method),
+            method_label=self._result_method_label(),
+            omega0_ha=omega0_ha,
+            omega0_ev=omega0_ha * ha2eV,
+            omega0_includes_delta_a=False,
+            a_minus_source=source,
+            eq15_applied=applied,
+            eq15_reason=reason,
+            quoted_zero=quoted_zero,
+            spin_warning=spin_warning,
+            note=note,
+            roots=computed,
+            singlets=singlets,
+            triplets=triplets,
+            others=others,
+            reference_spin_rows=reference_spin_rows,
+            s0=s0,
+            t1=t1,
+            s0_vs_roks_ha=None if s0 is None else s0.vs_roks_ha,
+            s0_vs_roks_ev=None if s0 is None else s0.vs_roks_ev,
+            t1_vs_roks_ha=None if t1 is None else t1.vs_roks_ha,
+            t1_vs_roks_ev=None if t1 is None else t1.vs_roks_ev,
+            gap_ha=gap_ha,
+            gap_ev=None if gap_ha is None else gap_ha * ha2eV,
+            e_s0_ha=None if s0 is None else s0.quoted_ha,
+            e_s0_ev=None if s0 is None else s0.quoted_ev,
+            e_t1_ha=None if t1 is None else t1.quoted_ha,
+            e_t1_ev=None if t1 is None else t1.quoted_ev,
+            roots_vs_roks_ha=energies[:nstates].copy(),
+            roots_vs_roks_ev=energies[:nstates].copy() * ha2eV,
+            roots_vs_t1_ha=(
+                np.full(nstates, np.nan) if t1_vs_roks is None
+                else energies[:nstates].copy() - t1_vs_roks
+            ),
+            roots_vs_t1_ev=(
+                np.full(nstates, np.nan) if t1_vs_roks is None
+                else (energies[:nstates].copy() - t1_vs_roks) * ha2eV
+            ),
+            roots_eq15_ha=energies[:nstates].copy() - omega0_ha,
+            roots_eq15_ev=(energies[:nstates].copy() - omega0_ha) * ha2eV,
+        )
+        self.s0_t1 = report
+        gap_text = "n/a" if report.gap_ev is None else f"{report.gap_ev:.6f}"
+        logger.info(
+            f"S0-T1 gap {gap_text} eV, omega0 {report.omega0_ev:.6f} eV, "
+            f"Eq. (15) applied={report.eq15_applied}"
+        )
+        if print_report:
+            _print_s0_t1_report(report)
+        return report
+
     def analyse(
         self,
         threshold=0.05,
@@ -1686,6 +2419,8 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
         energy_tol=1.0e-5,
         projection_backend="auto",
         symmetry_kwargs=None,
+        s0_t1=False,
+        eq15=None,
     ):
         energies = _asnumpy(self.e) * ha2eV
         self.dS2 = self.deltaS2()
@@ -1738,11 +2473,20 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
                 f'OO(1):{100*((x_oo**2).sum()):6.3f}%'
             )
             print("========================================")
+        if s0_t1:
+            self.s0_t1_report(eq15=eq15, print_report=True)
         return self.dS2
 
     def kernel(self, nstates=1, remove=None, frozen=None, foo=1.0, d_lda=0.3,
                fglobal=None, fit=True, save=False, save_file=None, init_space=None,
-               hdiag_file=None):
+               hdiag_file=None, s0_t1=False, eq15=None):
+        """Solve XSF-TDA-down.
+
+        Returns excitation energies in eV relative to the high-spin reference,
+        and the eigenvectors. ``s0_t1=True`` also stores and prints
+        ``self.s0_t1`` (triplet energies and the S0–T1 gap) without changing
+        those eigenvalues. ``eq15`` is only used when ``s0_t1`` is true.
+        """
         self.foo = foo
         self.re = (
             _asnumpy(self.mf.mo_coeff).ndim != 3 and self.SA > 0
@@ -1765,6 +2509,22 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
         else:
             self._prepare_dense_A(foo=foo, fglobal=fglobal, frozen=frozen)
             self._diagonalize_dense(self.A, self.nstates)
+        if s0_t1:
+            self.s0_t1_report(eq15=eq15, print_report=True)
         if save:
-            self.save_results(save_file, fglobal=self.fglobal, remove=self.re)
+            extra = {}
+            if s0_t1 and getattr(self, "s0_t1", None) is not None:
+                report = self.s0_t1
+                extra = {
+                    "omega0_ha": report.omega0_ha,
+                    "gap_ha": np.nan if report.gap_ha is None else report.gap_ha,
+                    "eq15_applied": report.eq15_applied,
+                    "s0_vs_roks_ha": (
+                        np.nan if report.s0_vs_roks_ha is None else report.s0_vs_roks_ha
+                    ),
+                    "t1_vs_roks_ha": (
+                        np.nan if report.t1_vs_roks_ha is None else report.t1_vs_roks_ha
+                    ),
+                }
+            self.save_results(save_file, fglobal=self.fglobal, remove=self.re, **extra)
         return _asnumpy(self.e[:self.nstates] * ha2eV), self.v[:, :self.nstates]

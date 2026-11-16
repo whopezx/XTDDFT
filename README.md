@@ -103,6 +103,44 @@ conventional SF-TDA space; restricted `SA>0` calculations project out the
 $S_-|\Phi_0\rangle$ reference component. Pass `remove=True` or `False`
 to override this default.
 
+Triplet energies and the S0–T1 gap are opt-in and do not change the
+energies returned by `kernel()`. For a triplet ROKS reference the
+spin-adapted roots are singlets. T1 is the $M_S=S-1$ component of that
+same triplet (Chibueze & Visscher, *J. Chem. Phys.* **163**, 094111
+(2025), Eq. (12)), with
+
+$$
+\omega_0 = \mathbf{x}^{\mathrm{T}}[\mathbf{A}^-]\mathbf{x}
+= E(\mathrm{T}_1)-E(\mathrm{ROKS}).
+$$
+
+S0 is the lowest singlet XSF root. The gap is
+$E(\mathrm{S}_0)-E(\mathrm{T}_1)=\omega_{\mathrm{S}_0}-\omega_0$, both
+measured from the high-spin reference. Eq. (15),
+$\tilde\omega_\lambda=\omega_\lambda-\omega_0$, is applied for ALDA0
+(`method=0`). Collinear (`method=2`) and multicollinear (`method=1`)
+kernels keep the ROKS zero unless `eq15=True`. $\omega_0$ is always an
+expectation value of $\mathbf{A}^-$; the spin-adaptation $\Delta A$ is
+not included. `self.e` stays on the ROKS zero either way. `eq15=False`
+leaves the quoted S0 and T1 energies on that zero too; `eq15=True`
+quotes them from corrected T1. The gap number is the same either way.
+
+```python
+energies_ev, vectors = td.kernel(nstates=4)
+report = td.s0_t1_report()          # or kernel(..., s0_t1=True)
+report.gap_ev                       # E(S0) - E(T1), eV
+report.omega0_ev                    # E(T1) - E(ROKS), eV
+report.s0_vs_roks_ev                # E(S0) - E(ROKS), eV
+report.eq15_applied                 # True for ALDA0
+report.e_s0_ev                      # quoted S0 (versus T1 if Eq. 15)
+report.triplets                     # T1, and any other SFD triplets
+```
+
+`analyse(..., s0_t1=True)` prints the same report. Other reference-spin
+roots found at `SA=0` are labeled T2, T3, .... A quintet reference has
+triplet spin-flip-down roots but no S0 in this space, so the gap is left
+unset.
+
 ## Transition densities, dipoles, and NTOs
 
 XTDA uses physical state labels: state 0 is the reference ground state and

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import sys
 import math
+import types
 from pyscf import scf, lib, __config__
 from pyscf.lib import logger
 from pyscf.dft import numint2c
@@ -968,19 +969,27 @@ def grad_elec(td, fglobal=None, foo=1, atmlst=None, max_memory=2000, verbose=log
 
 
 class _RO2U:
-    '''Wrap ROKS mf, make mo_coeff and mo_occ have same dim with UKS'''
+    '''Wrap ROKS mf, make mo_coeff and mo_occ have same dim with UKS.
+
+    ``base`` is a one-way holder. It must not point back at this wrapper:
+    a self-reference keeps the copied SCF, and that geometry step's integral
+    arrays, alive until cyclic GC.
+    '''
     def __init__(self, td_grad, mf, sftda):
         xp = array_module(mf)
         self.mol = td_grad.mol
         self.verbose = getattr(td_grad, 'verbose', logger.INFO)
         self.stdout = getattr(td_grad, 'stdout', sys.stdout)
-        self.base = self
-        self._scf = mf.copy()
-        self._scf.mo_occ = xp.asarray(sftda.mo_occ)
-        self._scf.mo_coeff = xp.asarray(sftda.mo_coeff)
-        self._scf.mo_energy = xp.asarray(sftda.mo_energy)
-        self.collinear_samples = sftda.collinear_samples
-        self.exclude_nlc = True
+        scf_view = mf.copy()
+        scf_view.mo_occ = xp.asarray(sftda.mo_occ)
+        scf_view.mo_coeff = xp.asarray(sftda.mo_coeff)
+        scf_view.mo_energy = xp.asarray(sftda.mo_energy)
+        # Kernel callers read these on td_grad.base (mol/verbose/stdout stay here).
+        self.base = types.SimpleNamespace(
+            _scf=scf_view,
+            collinear_samples=sftda.collinear_samples,
+            exclude_nlc=True,
+        )
 
 
 class SFD_gradient(rohf_grad.Gradients):

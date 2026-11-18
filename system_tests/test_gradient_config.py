@@ -224,3 +224,128 @@ def test_sf_df_derivative_dispatch_preserves_nonsymmetric_pairs(monkeypatch, mod
 def test_cpu_df_gradient_is_accepted(reference):
     from XTDDFT.XTDDFT.grad._backend import validate_gradient_backend
     validate_gradient_backend(_gradient_reference(gpu=False, reference=reference))
+
+
+class _HeldArray:
+    """Stand-in for a geometry step's integral array."""
+
+
+class _ShallowROKS:
+    """Shallow copy, same contract as pyscf StreamObject.copy."""
+
+    def __init__(self):
+        self.mo_occ = np.array([2., 1., 0.])
+        self.mo_coeff = np.arange(9, dtype=float).reshape(3, 3)
+        self.mo_energy = np.array([-0.5, 0.1, 0.4])
+        self._eri = _HeldArray()
+
+    def copy(self):
+        import copy
+        return copy.copy(self)
+
+
+@pytest.mark.parametrize("module_name", ["gradient_roks_sfd", "gradient_roks_sfu"])
+def test_roks_sf_wrapper_is_not_a_cycle_and_keeps_kernel_attributes(module_name):
+    import gc
+    import weakref
+    from importlib import import_module
+
+    module = import_module("XTDDFT.XTDDFT.grad." + module_name)
+    mf = _ShallowROKS()
+    original_occ = mf.mo_occ.copy()
+    original_coeff = mf.mo_coeff.copy()
+    original_energy = mf.mo_energy.copy()
+    mol = object()
+    stdout = object()
+    uks_occ = np.array([[1., 1., 0.], [1., 0., 0.]])
+    uks_coeff = np.stack((np.eye(3), np.eye(3) * 2))
+    uks_energy = np.array([[-0.5, 0.1, 0.4], [-0.4, 0.2, 0.5]])
+    sftda = SimpleNamespace(
+        mo_occ=uks_occ,
+        mo_coeff=uks_coeff,
+        mo_energy=uks_energy,
+        collinear_samples=24,
+    )
+    td_grad = SimpleNamespace(mol=mol, verbose=4, stdout=stdout)
+    wrapper = module._RO2U(td_grad, mf, sftda)
+
+    assert wrapper.base is not wrapper
+    assert wrapper not in gc.get_referents(wrapper.base)
+    assert wrapper.mol is mol
+    assert wrapper.verbose == 4
+    assert wrapper.stdout is stdout
+    assert wrapper.base.collinear_samples == 24
+    assert wrapper.base.exclude_nlc is True
+    assert wrapper.base._scf is not mf
+    # Same reads as _contract_xc_kernel: base._scf, with mo_* fallback on base.
+    viewed = wrapper.base._scf
+    np.testing.assert_array_equal(getattr(wrapper.base, "mo_coeff", viewed.mo_coeff), uks_coeff)
+    np.testing.assert_array_equal(getattr(wrapper.base, "mo_occ", viewed.mo_occ), uks_occ)
+    np.testing.assert_array_equal(viewed.mo_energy, uks_energy)
+    np.testing.assert_array_equal(mf.mo_occ, original_occ)
+    np.testing.assert_array_equal(mf.mo_coeff, original_coeff)
+    np.testing.assert_array_equal(mf.mo_energy, original_energy)
+    assert mf.mo_occ is not viewed.mo_occ
+    eri_ref = weakref.ref(mf._eri)
+    wrap_ref = weakref.ref(wrapper)
+    copy_ref = weakref.ref(viewed)
+    # del has to happen in this frame. A helper would keep the caller's names.
+    gc.disable()
+    try:
+        del wrapper, viewed
+        assert wrap_ref() is None
+        assert copy_ref() is None
+        # The live mean field still owns the integrals.
+        assert eri_ref() is mf._eri
+        del mf
+        assert eri_ref() is None
+    finally:
+        gc.enable()
+
+
+def test_roks_sc_wrapper_is_not_a_cycle_and_builds_uks_orbitals():
+    import gc
+    import weakref
+    from importlib import import_module
+
+    module = import_module("XTDDFT.XTDDFT.grad.gradient_roks_sc")
+    mf = _ShallowROKS()
+    original_occ = mf.mo_occ.copy()
+    original_coeff = mf.mo_coeff.copy()
+    original_energy = mf.mo_energy.copy()
+    mol = object()
+    stdout = object()
+    td_grad = SimpleNamespace(mol=mol, verbose=3, stdout=stdout)
+    wrapper = module._RO2U(td_grad, mf)
+
+    assert wrapper.base is not wrapper
+    assert wrapper not in gc.get_referents(wrapper.base)
+    assert wrapper.mol is mol
+    assert wrapper.verbose == 3
+    assert wrapper.stdout is stdout
+    viewed = wrapper.base._scf
+    assert viewed is not mf
+    np.testing.assert_array_equal(
+        viewed.mo_occ, np.array([[1., 1., 0.], [1., 0., 0.]])
+    )
+    np.testing.assert_array_equal(viewed.mo_coeff[0], original_coeff)
+    np.testing.assert_array_equal(viewed.mo_coeff[1], original_coeff)
+    np.testing.assert_array_equal(viewed.mo_energy[0], original_energy)
+    np.testing.assert_array_equal(viewed.mo_energy[1], original_energy)
+    np.testing.assert_array_equal(mf.mo_occ, original_occ)
+    np.testing.assert_array_equal(mf.mo_coeff, original_coeff)
+    np.testing.assert_array_equal(mf.mo_energy, original_energy)
+    assert mf.mo_coeff is not viewed.mo_coeff
+    eri_ref = weakref.ref(mf._eri)
+    wrap_ref = weakref.ref(wrapper)
+    copy_ref = weakref.ref(viewed)
+    gc.disable()
+    try:
+        del wrapper, viewed
+        assert wrap_ref() is None
+        assert copy_ref() is None
+        assert eri_ref() is mf._eri
+        del mf
+        assert eri_ref() is None
+    finally:
+        gc.enable()

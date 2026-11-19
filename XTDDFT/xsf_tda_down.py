@@ -1007,7 +1007,8 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
         arr = get_array_module(blocks[0])
         return arr.concatenate(blocks, axis=0)
 
-    def gen_tda_operation_sf(self, foo=1.0, fglobal=1.0, hdiag_file=None):
+    def gen_tda_operation_sf(self, foo=1.0, fglobal=1.0, hdiag_file=None,
+                             use_delta_a=None, project_oo=None):
         """构造 spin-flip-down TDA 的 Davidson 算子和预条件器对角元。
 
         Davidson 向量按 CV、CO、OV、OO 四个激发块排列。对于受限开壳层
@@ -1022,6 +1023,12 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
             缩放全部 Delta-A 修正；不会缩放基础 TDA 响应。
         hdiag_file : str or None
             Davidson 预条件器对角元的可选缓存文件；存在时读取，否则计算并保存。
+        use_delta_a : bool or None
+            Include the Delta-A correction. None follows ``self.SA`` on a
+            restricted reference. False keeps the base A-minus response.
+        project_oo : bool or None
+            Project the OO block with ``get_vect()``. None follows ``self.re``
+            at each matvec. False keeps the full CV|CO|OV|OO vector.
 
         Returns
         -------
@@ -1032,7 +1039,15 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
         """
         nc, no, nv = self.nc, self.no, self.nv
         si = no / 2.0
-        if self.SA > 0 and _asnumpy(self.mf.mo_coeff).ndim != 3 and abs(2 * si - 1) < 1e-12:
+        if use_delta_a is None:
+            use_delta_a = self.SA > 0 and _asnumpy(self.mf.mo_coeff).ndim != 3
+        else:
+            use_delta_a = bool(use_delta_a)
+        # None tracks self.re when the matvec runs. An explicit flag is fixed
+        # so an A-minus product does not inherit a later SA=3 / remove=True solve.
+        project_oo_fixed = None if project_oo is None else bool(project_oo)
+        project_now = bool(self.re) if project_oo_fixed is None else project_oo_fixed
+        if use_delta_a and abs(2 * si - 1) < 1e-12:
             raise ValueError(
                 "Table-3 Delta A contains 2*S_i-1 denominators and is singular for S_i=1/2. "
                 "Use SA=0 for doublet references."
@@ -1056,7 +1071,7 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
             )
 
         # Delta-A 只用于受限开壳层参考态；UHF/UKS 路径使用基础响应。
-        use_delta_a = self.SA > 0 and _asnumpy(self.mf.mo_coeff).ndim != 3
+        # use_delta_a 已在上方按 self.SA 或调用参数确定，这里不能再覆盖。
         if use_delta_a:
             vresp_hf = self.gen_response_sf_delta_A(hermi=0)
             fockA_hf, fockB_hf = _get_hf_mo_fock(self.mf, mo_coeff, mo_occ)
@@ -1071,9 +1086,9 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
             fs_cv = fockS_hf[:nc, nc + no:]
 
         # 受限参考态的 OO 块含一个冗余态，Davidson 空间中将其投影掉。
-        if self.re:
+        if project_now:
             self.vects = xp.asarray(self.get_vect())
-        expected_hdiag_size = (nc + no) * (no + nv) - (1 if self.re else 0)
+        expected_hdiag_size = (nc + no) * (no + nv) - (1 if project_now else 0)
         hdiag = self._load_hdiag_file(hdiag_file, expected_hdiag_size)
         if hdiag is None:
             hdiag = self._build_preconditioner_hdiag(
@@ -1081,7 +1096,7 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
                 fockA_hf=fockA_hf if use_delta_a else None,
                 fockB_hf=fockB_hf if use_delta_a else None,
             )
-            if self.re:
+            if project_now:
                 hdiag = self._compress_removed_hdiag(hdiag)
             self._save_hdiag_file(hdiag_file, hdiag)
 
@@ -1109,7 +1124,8 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
 
         def vind(zs0):
             zs0 = xp.asarray(zs0)
-            cv, co, ov, oo = self._split_block_vectors(zs0, self.re)
+            project = bool(self.re) if project_oo_fixed is None else project_oo_fixed
+            cv, co, ov, oo = self._split_block_vectors(zs0, project)
 
             # 试探向量从 MO 激发空间变换到 AO transition density。
             dmov = (
@@ -1248,7 +1264,9 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
                 vs_ov += fglobal * dov
                 vs_oo += fglobal * doo
 
-            return self._join_block_vectors(vs_cv, vs_co, vs_ov, vs_oo)
+            return self._join_block_vectors(
+                vs_cv, vs_co, vs_ov, vs_oo, compress_oo=project,
+            )
 
         return vind, hdiag
 
@@ -1740,10 +1758,94 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
             print("========================================")
         return self.dS2
 
+    def _check_omega0_reference(self):
+        """omega0 is the ROHF/ROKS intra-multiplet expectation, Eq. (12)."""
+        if _asnumpy(self.mf.mo_coeff).ndim == 3:
+            raise NotImplementedError(
+                "omega0 is the restricted open-shell intra-multiplet expectation "
+                "and is not implemented for UKS/UHF references."
+            )
+        no = int(self.no)
+        if no < 1:
+            raise ValueError(
+                "omega0 needs at least one open-shell orbital "
+                "(n_open = N_alpha - N_beta >= 1)."
+            )
+        nc, nv = int(self.nc), int(self.nv)
+        occ_a = np.asarray(_asnumpy(self.occidx_a), dtype=int)
+        vir_b = np.asarray(_asnumpy(self.viridx_b), dtype=int)
+        if (
+            not np.array_equal(occ_a, np.arange(nc + no))
+            or not np.array_equal(vir_b, np.arange(nc, nc + no + nv))
+        ):
+            raise NotImplementedError(
+                "omega0 assumes high-spin RO orbitals ordered closed, open, virtual."
+            )
+
+    def _intra_multiplet_vector(self):
+        """Eq. (12) amplitude in the full unprojected CV|CO|OV|OO space.
+
+        x(mα → nβ) = δ_mn / sqrt(2S), with 2S = n_open. CV, CO, OV, and
+        off-diagonal OO entries are zero. This is the normalized sum of the
+        open-shell spin flips, the same OO direction removed by ``get_vect()``.
+        """
+        self._check_omega0_reference()
+        nc, no, nv = int(self.nc), int(self.no), int(self.nv)
+        dim3 = nc * nv + nc * no + no * nv
+        vector = np.zeros(dim3 + no * no)
+        vector[dim3 + np.arange(no) * (no + 1)] = 1.0 / np.sqrt(no)
+        return vector
+
+    def _full_sf_dimension(self):
+        return (int(self.nc) + int(self.no)) * (int(self.no) + int(self.nv))
+
+    def _apply_a_minus(self, vector):
+        """Apply A-minus once in the full space, without Delta A or OO projection."""
+        vector = np.asarray(_asnumpy(vector), dtype=float).reshape(-1)
+        full = self._full_sf_dimension()
+        if vector.size != full:
+            raise ValueError(
+                f"A-minus expects a full-space vector of length {full}, got {vector.size}."
+            )
+        vind, _hdiag = self.gen_tda_operation_sf(use_delta_a=False, project_oo=False)
+        product = np.asarray(_asnumpy(vind(vector)), dtype=float).reshape(-1)
+        if product.size != full:
+            raise RuntimeError(
+                f"A-minus matvec returned length {product.size}, expected {full}."
+            )
+        return product
+
+    def _evaluate_omega0(self):
+        """Store omega0 = x^T [A-minus] x in Hartree.
+
+        A-minus is the spin-flip-down matrix with no Delta A, on the full
+        CV|CO|OV|OO space. A dense base matrix already built for this object
+        (``sf_tda_A``) may be used; otherwise this is one response matvec.
+        """
+        amplitude = self._intra_multiplet_vector()
+        matrix = getattr(self, "sf_tda_A", None)
+        if (
+            not self.davidson
+            and matrix is not None
+            and np.shape(matrix) == (amplitude.size, amplitude.size)
+        ):
+            ax = np.real(np.asarray(matrix) @ amplitude)
+        else:
+            ax = self._apply_a_minus(amplitude)
+        self.omega0 = float(np.real(np.vdot(amplitude, ax)))
+        self.omega0_ev = float(self.omega0 * ha2eV)
+        print(f"omega0 = {self.omega0:.10f} Ha ({self.omega0_ev:.6f} eV)")
+        logger.info(
+            f"XSF_TDA_down omega0 = {self.omega0:.10f} Ha ({self.omega0_ev:.6f} eV)"
+        )
+        return self.omega0
+
     def kernel(self, nstates=1, remove=None, frozen=None, foo=1.0, d_lda=0.3,
                fglobal=None, fit=True, save=False, save_file=None, init_space=None,
-               hdiag_file=None):
+               hdiag_file=None, omega0=False):
         self.foo = foo
+        if omega0:
+            self._check_omega0_reference()
         self.re = (
             _asnumpy(self.mf.mo_coeff).ndim != 3 and self.SA > 0
             if remove is None else bool(remove)
@@ -1765,6 +1867,8 @@ class XSF_TDA_down(XTDDFT_base): # just for ROKS
         else:
             self._prepare_dense_A(foo=foo, fglobal=fglobal, frozen=frozen)
             self._diagonalize_dense(self.A, self.nstates)
+        if omega0:
+            self._evaluate_omega0()
         if save:
             self.save_results(save_file, fglobal=self.fglobal, remove=self.re)
         return _asnumpy(self.e[:self.nstates] * ha2eV), self.v[:, :self.nstates]

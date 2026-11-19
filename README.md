@@ -103,6 +103,16 @@ conventional SF-TDA space; restricted `SA>0` calculations project out the
 $S_-|\Phi_0\rangle$ reference component. Pass `remove=True` or `False`
 to override this default.
 
+`kernel(..., omega0=True)` also evaluates the intra-multiplet expectation
+$\omega_0 = x^T[A^-]x$ (Chibueze and Visscher, J. Chem. Phys. 163, 094111
+(2025), Eq. (12) and the quadratic form after Eq. (15)). $A^-$ is the
+unprojected spin-flip-down matrix without the $\Delta A$ correction, even
+when the solve itself uses `SA=3` and `remove=True`. The value is stored
+as `td.omega0` in Hartree and `td.omega0_ev` in eV, and it is printed when
+the option is on. The option defaults to off and does not change the
+returned excitation energies or vectors. It requires a restricted
+open-shell reference with at least one open shell.
+
 ## Transition densities, dipoles, and NTOs
 
 XTDA uses physical state labels: state 0 is the reference ground state and

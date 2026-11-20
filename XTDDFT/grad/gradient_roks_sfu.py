@@ -716,7 +716,12 @@ def grad_elec(td, atmlst=None, max_memory=2000, verbose=logger.INFO):
 
 
 class _RO2U:
-    '''Wrap ROKS mf, make mo_coeff and mo_occ have same dim with UKS'''
+    '''Wrap ROKS mf, make mo_coeff and mo_occ have same dim with UKS.
+
+    ``base`` is a one-way holder. It must not point back at this wrapper:
+    a self-reference keeps the copied SCF, and that geometry step's integral
+    arrays, alive until cyclic GC.
+    '''
     def __init__(self, td_grad, mf, sftda):
         xp = array_module(mf)
         self.mol = td_grad.mol
